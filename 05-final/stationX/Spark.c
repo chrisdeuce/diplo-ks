@@ -8,20 +8,17 @@
 #include <linux/delay.h>
 
 #define MPL3115_STATUS 0x00
-#define MPL3115_OUT_PRESS 0x01 /* MSB first, 20 bit */
-#define MPL3115_OUT_TEMP 0x04 /* MSB first, 12 bit */
+#define MPL3115_OUT_PRESS 0x01 
+#define MPL3115_OUT_TEMP 0x04 
 #define MPL3115_WHO_AM_I 0x0c
 #define MPL3115_CTRL_REG1 0x26
-
 #define MPL3115_DEVICE_ID 0xc4
-
 #define MPL3115_STATUS_PRESS_RDY BIT(2)
 #define MPL3115_STATUS_TEMP_RDY BIT(1)
-
-#define MPL3115_CTRL_RESET BIT(2) /* software reset */
-#define MPL3115_CTRL_OST BIT(1) /* initiate measurement */
-#define MPL3115_CTRL_ACTIVE BIT(0) /* continuous measurement */
-#define MPL3115_CTRL_OS_258MS (BIT(5) | BIT(4)) /* 64x oversampling */
+#define MPL3115_CTRL_RESET BIT(2) 
+#define MPL3115_CTRL_OST BIT(1) 
+#define MPL3115_CTRL_ACTIVE BIT(0)
+#define MPL3115_CTRL_OS_258MS (BIT(5) | BIT(4)) 
 
 struct mpl3115_data {
         struct i2c_client *client;
@@ -33,7 +30,6 @@ static int mpl3115_request(struct mpl3115_data *data)
 {
         int ret, tries = 15;
 
-        /* trigger measurement */
         ret = i2c_smbus_write_byte_data(data->client, MPL3115_CTRL_REG1,
                 data->ctrl_reg1 | MPL3115_CTRL_OST);
        if (ret < 0)
@@ -70,7 +66,7 @@ static int mpl3115_read_raw(struct iio_dev *indio_dev,
                 if (iio_buffer_enabled(indio_dev))
                         return -EBUSY;
                  switch (chan->type) {
-                 case IIO_PRESSURE: /* in 0.25 pascal / LSB */
+                 case IIO_PRESSURE:
                         mutex_lock(&data->lock);
                         ret = mpl3115_request(data);
                         if (ret < 0) {
@@ -84,7 +80,7 @@ static int mpl3115_read_raw(struct iio_dev *indio_dev,
                                 return ret;
                         *val = be32_to_cpu(tmp) >> 12;
                         return IIO_VAL_INT;
-                case IIO_TEMP: /* in 0.0625 celsius / LSB */
+                case IIO_TEMP: 
                         mutex_lock(&data->lock);
                         ret = mpl3115_request(data);
                         if (ret < 0) {
@@ -105,7 +101,7 @@ static int mpl3115_read_raw(struct iio_dev *indio_dev,
                 switch (chan->type) {
                 case IIO_PRESSURE:
                         *val = 0;
-                        *val2 = 250; /* want kilopascal */
+                        *val2 = 250; 
                         return IIO_VAL_INT_PLUS_MICRO;
                 case IIO_TEMP:
                         *val = 0;
@@ -123,7 +119,7 @@ static irqreturn_t mpl3115_trigger_handler(int irq, void *p)
         struct iio_poll_func *pf = p;
         struct iio_dev *indio_dev = pf->indio_dev;
         struct mpl3115_data *data = iio_priv(indio_dev);
-        u8 buffer[16]; /* 32-bit channel + 16-bit channel + padding + ts */
+        u8 buffer[16]; 
         int ret, pos = 0;
 
         mutex_lock(&data->lock);
@@ -154,7 +150,7 @@ static irqreturn_t mpl3115_trigger_handler(int irq, void *p)
         }
         mutex_unlock(&data->lock);
 
-        iio_push_to_buffers_with_timestamp(indio_dev, buffer, iio_get_time_ns(/*indio_dev*/));
+        iio_push_to_buffers_with_timestamp(indio_dev, buffer, iio_get_time_ns(indio_dev));
 done:
         iio_trigger_notify_done(indio_dev->trig);
         return IRQ_HANDLED;
@@ -224,7 +220,6 @@ static int mpl3115_probe(struct i2c_client *client,
         indio_dev->channels = mpl3115_channels;
         indio_dev->num_channels = ARRAY_SIZE(mpl3115_channels);
 
-        /* software reset, I2C transfer is aborted (fails) */
         i2c_smbus_write_byte_data(client, MPL3115_CTRL_REG1,
                 MPL3115_CTRL_RESET);
         msleep(50);
