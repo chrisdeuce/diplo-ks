@@ -42,7 +42,20 @@ static struct i2c_dev *get_free_i2c_dev(struct i2c_adapter *adap)
 {
   struct i2c_dev *i2c_dev;
 
-  if(adap->nr) 
+  if(adap->nr >= I2C_MINORS){
+    printk(KERN_ERR "spark-dev: Out of device minors (%d)\n",
+	   adap->nr);
+    return ERR_PTR(-ENOMEM);
+  }
+  i2c_dev =kzalloc(sizeof(*i2c_dev),GFP_KERNEL);
+  if(!i2d_dev)
+    return ERR_PTR(ENOMEM);
+  i2c_dev->adap = adap;
+
+  spin_lock(&i2c_dev_list_lock);
+  list_add_tail()&i2c_dev->list,&i2c_dev_list);
+spin_unlock(&i2c_dev_list_lock);
+return i2c_dev;
 }
 
 static void sparkmod_handler(struct sp_struct *s);
