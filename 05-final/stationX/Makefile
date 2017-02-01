@@ -1,8 +1,6 @@
-obj-m += Spark.o
+obj-m +=spark_m.o
 
 all:
-	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
-
+    make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- -C /home/felix/Documents/develop/kbuild/linux M=$(PWD) modules
 clean:
-	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
-
+    make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- -C /home/felix/Documents/develop/kbuild/linux M=$(PWD) clean
