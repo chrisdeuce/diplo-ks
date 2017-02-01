@@ -1,30 +1,228 @@
+/*
+**Información del driver
+**date:    Jan 20 2017
+**version: 1.0
+**brief:  Driver para utilizar la estación meteorologica I2C sparkfun weathershield 
+*/
 #include <linux/module.h>
-#include <linux/i2c.h>
-#include <linux/iio/iio.h>
-#include <linux/iio/sysfs.h>
-#include <linux/iio/trigger_consumer.h>
-#include <linux/iio/buffer.h>
-#include <linux/iio/triggered_buffer.h>
+#include <linux/init.h>
+#include <linux/device.h>
 #include <linux/kernel.h>
-#include <linux/timer.h>
 #include <linux/input.h>
-#include <linux/delay.h>
-
-#define DRV_NAME "spark"
-#define spark_STATUS 0x00
-#define spark_OUT_PRESS 0x01
-#define spark_OUT_TEMP 0x04
-#define spark_WHO_AM_I 0x0c
-#define spark_CONTROL_REG1 0x26
-#define spark_DEVICE_ID 0xc4
-#define spark_STATUS_PRESS_RDY BIT(2)
-#define spark_STATUS_TEMP_RDY BIT(1)
-#define spark_CTRL_RESET BIT(2)
-#define spark_CTRL_OST BIT(1)
-#define spark_CTRL_ACTIVE BIT(0)
-#define spark_CTRL_OS_258MS (BIT(5) | BIT(4)) /*sobre muestreo*/
+#include <linux/fs.h>
+#include <linux/stddef.h>
+#include <linux/spinlock.h>
+#include <linux/config.h>
+#include <linux/i2c.h>
+#include <linux/gpio.h>
+#include <asm/atomic.h>
+#include <asm/uaccess.h> // copy to user ; copy from user
+#define DEVICE_NAME "spark"  // El dispositivo aparecera en /dev/spark/
+#define CLASS_NAME "spk"    // Tipo de dispositivo
+#define REG_PRESS 0X01  // Registro en donde se lee la presión
+#define REG_TEMP 0X04  // Registro en donde se lee la temperatura
 
 
+static struct spark_data data;
+static unsigned int irqNumber;
+static u8 sensor_input[2];
+static unsigned int irqNumber;
+
+
+static void sparkmod_handler(struct sp_struct *s);
+
+static struct spark_data_struct {
+  u8 tempdata;
+  u8 pressdata;
+  unsigned int irq;
+} spark_data;
+
+
+static int majorNumber;                     // Almacena el número de dispositivo
+static char message[256] ={0};              // Memoria para la cadena que pasa del espacio de usuario
+static short size_of_message;               // Utilizado para saber el tamaño de la cadena almacenada
+static int numberOpens =0;                  // Contador de uso del dispositivo
+static struct class* sparkClass = NULL;     // puntero de la clase del dispositivo
+static struct device* sparkDevice = NULL;   // puntero a la estructura del dispositivo
+
+
+
+/* Funciones prototipo para el driver */
+static int dev_open(struct inode *, struct file *);
+static int dev_release(struct inode *, struct file *);
+static ssize_t dev_read(struct file *,char *, size_t,loff_t *);
+static ssize_t dev_write(struct file *, const char *, size_t, loff_t*);
+
+/*Brief devices*/
+static struct file_operations fops =
+{
+    .open = dev_open,
+    .read = dev_read,
+    .write = dev_write,
+    .release = dev_release,
+};
+
+
+/*Iniciando el driver*/
+static int __init spark_init(void)
+{
+  printk(KERN_INFO "Sparkfun: Initializing the Sparkfun \n");
+  // Allocating a major number for the device
+  majorNumber = register_chrdev(0,DEVICE_NAME,&fops);
+  if (majorNumber<0)
+    {
+      printk(KERN_ALERT "Sparkfun failed to register a major number\n");
+      return majorNumber;
+    }
+  printk(KERN_INFO "Sparkfun: registered correctly with major number %d\n",majorNumber);
+  /*Register the device class*/
+  sparkClass = class_create(THIS_MODULE,CLASS_NAME);
+  if(IS_ERR(sparkClass)){
+    class_destroy(sparkClass);
+    unregister_chrdev(majorNumber,DEVICE_NAME);
+    printk(KERN_ALERT "Failed to register the device class\n");
+    return PTR_ERR(sparkClass);
+  }
+  printk(KERN_INFO "Sparkfun: device class created correctly\n");
+
+  /*Register the device driver*/
+  sparkDevice = device_create(sparkClass,NULL,MKDEV(majorNumber,0),NULL,DEVICE_NAME);
+  if(IS_ERR(sparkDevice)){
+    class_destroy(sparkClass);
+    unregister_chrdev(majorNumber,DEVICE_NAME);
+    printk(KERN_ALERT "Failed to create the device\n");
+    return PTR_ERR(sparkDevice);
+  }
+  printk(KERN_INFO "Sparkfun: device class created correctly\n");
+  return 0;
+}
+
+static void __exit spark_exit(void){
+  device_destroy(sparkClass,MKDEV(majorNumber,0)); /*Removing the device*/
+  class_unregister(sparkClass);
+  class_destroy(sparkClass);
+  unregister_chrdev(majorNumber,DEVICE_NAME);
+  printk(KERN_INFO "Sparkfun: Removing from kernel\n");
+}
+
+static int dev_open(struct inode *inodep, struct file *filep){
+  numberOpens++;
+  printk(KERN_INFO "Sparkfun: Device has been opened %d time(s)\n");
+  return 0;
+}
+
+static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *offset){
+  int error_count = 0;
+  error_count = copy_to_user(buffer,message,size_of_message);
+
+  if(error_count=0){
+    printk(KERN_INFO "Sparkfun: Driver reading\n",size_of_message);
+    return (size_of_message=0);
+  }
+  else{
+    printk(KERN_INFO "Sparkfun: Failed to send info from sensors to the user\n",error_count);
+    return -EFAULT;
+  }
+}
+
+static ssize_t dev_write(struct file *filep, const char *buffer, size_t len, loff_t *offset){
+  sprintf(message, "%s(%zu letters)",buffer, len);
+  size_of_message = strlen(message);
+  printk(KERN_INFO "Sparkfun: Received %zu characters from the sensor\n",len);
+  return len;
+}
+
+static irq_handler spark_handler(unsigned int irq, void *dev_id,struct pt_regs *regs){
+  static unsigned int int count = 0;
+  count++;
+  printk(KERN_INFO "Sparkfun: interrupt_handler(), count = %d\n",count);
+  if(wq)
+    queue_work(wq,&sparkmod_read);
+  return (irq_handler); IRQ_HANDLED;
+}
+
+static void sparkmod_handler(struct sp_struct *s)
+{
+  printk(KERN_INFO "Spark: reading from sensors\n");
+  sensor_input[0] = spark_read(,REG_TEMP);
+  sensor_input[1] = spark_read(,REG_PRESS);
+}
+
+/*Comunicación básica*/
+
+static s32 spark_access(struct i2c_adapter *adap, u16 addr,
+			unsigned short flags, char read_write,
+			u8 command, int size, union i2c_smbus_data *data)
+{
+  int i, len;
+  dev_info(&adap->dev,"%s was called with the following parameters:\n",__FUNCTION__);
+  dev_info(&adap->dev,"addr = %.4x\n",addr);
+  dev_info(&adap->dev,"flags = %.4x\n",flags);
+  dev_info(&adap->dev,"read_write = %s\n",read_write == I2C_SMBUS_WRITE ? "write" : "read");
+  dev_info(&adap->dev,"command = %d\n",command);
+
+  switch(size){
+  case I2C_SMBUS_PROC_CALL:,""
+      dev_info(&adap->dev,"size = I2C_SMBUS_PROC_CALL\n");
+    break;
+  case I2C_SMBUS_QUICK:
+    dev_info(&adap->dev,"size = I2C_SMBUS_QUICK\n");
+    break;
+  case I2C_SMBUS_BYTE:
+    dev_info(&adap->dev,"size = I2C_SMBUS_BYTE\n");
+    break;
+  case I2C_SMBUS_BYTE_DATA:
+    dev_info(&adap->dev,"size = I2C_SMBUS_BYTE_DATA\n");
+    if(read_write == I2C_SMBUS_WRITE)
+      dev_info(&adap->dev,"data = %.2x\n",data->byte);
+    break;
+  case I2C_SMBUS_WORD_DATA:
+    dev_info(&adap->dev,"size = I2C_SMBUS_WORD_DATA\n");
+    if(read_write == I2C_SMBUS_WRITE)
+      dev_info(&adap->dev,"data = %.4x\n",data->word);
+    break;
+  case I2C_SMBUS_BLOCK_DATA:
+    dev_info(&adap->dev,"size = I2C_SMBUS_BLOCK_DATA\n");
+    if(read_write == I2C_SMBUS_WRITE){
+      dev_info(&adap->dev,"data = %.4x\n",data->word);
+      len = data->block[0];
+      if(len<0)
+	len=0;
+      if(len>32)
+	len=32;
+      for(i=1;i<=len;i++)
+	dev_info(&adap->dev,"data->block[%d]=%.2x\n",i,data->block[i]);
+    }
+    break;
+  }
+  return 0;
+}
+
+static u32 spark_func(struct i2c_adapter *adapter)
+{
+ return I2C_FUNC_SMBUS_QUICK | 12C_FUNC_SMBUS_BYTE |
+   I2C_FUNC_SMBUS_BYTE_DATA | 12C_FUNC_SMBUS_WORD_DATA |
+   I2C_FUNC_SMBUS_BLOCK_DATA;
+}
+
+static struct i2c_algorithm spark_algorithm ={
+  .name          = "spark_algorithm",
+  .id            = I2C_ALGO_BUS,
+  .smbus_xfer    = spark_access,
+  .functionality = spark_func,
+};
+
+static struct i2c_adapter spark_adapter = {
+  .owner         = THIS_MODULE,
+  .class         = I2C_ADAP_CLASS_SMBUS,
+  .algo          = &spark_algorithm,
+  .name          = "spark_adapter",
+};
+
+static int dev_release(struct inode *inodep,struct file *filep){
+  printk(KERN_INFO "Sparkfun: Device successfully closed\n");
+  return 0;
+}
 
 //Register functions
 MODULE_LICENSE("GPL");
@@ -32,264 +230,5 @@ MODULE_AUTHOR("Team StationX");
 MODULE_DESCRIPTION("Homebrew driver for sparkfun weather station");
 MODULE_VERSION("0.1");
 
-struct spark_data {
-  struct i2c_client *client;
-  struct mutex lock;
-  u8 ctrl_reg1;
-};
-
-static int spark_request(struct spark_data *data){
-  int ret, tries = 15;
-  ret= i2c_smbus_write_byte_data(data->client,spark_CTRL_REG1,
-				 data->ctrl_reg1 | spark_CTRL_OST);
-  if (ret<0)
-      return ret;
-  while (tries-- >0) {
-    ret =i2c_smbus_read_byte_data(data->client,spark_CTRL_REG1);
-    if(ret<0)
-      return ret;
-    if(!(ret & spark_CTRL_OST))
-      break;
-    msleep(20);
-  }
-  if(tries<0){
-    dev_err(&data->client->dev, "data not ready\n");
-    return -EIO;
-    }
-  return 0;
- }
-
-static int spark_read_raw(struct iio_dev *indio_dev,
-			  struct iio_chan_spec const *chan,
-			  int *val, int val2, long mask){
-  struct spark_data *data = iio_priv(indio_dev);
-  __be32 tmp=0;
-  int ret;
-  switch (mask){
-  case IIO_CHAN_INFO_RAW:
-    if(iio_buffer_enabled(indio_dev))
-      return -EBUSY;
-    switch(chan->type){
-    case IIO_PRESSURE: /*lsb*/
-      mutex_lock(&data->lock);
-      ret = spark_request(data);
-    if(ret < 0){
-	mutex_unlock(&data->lock)
-    return ret;
-      }
-
-    ret = i2c_smbus_read_i2c_block_data(data->client,
-					spark_OUT_PRESS,3,(u8 *)&tmp);
-    mutex_unlock(&data->lock);
-    if(ret < 0)
-      return re;
-    *val = be2_to_cpu(tmp)>>12;
-    return IIO_VAL_INT;
-    case IIO_TEMP: /* LSB */
-      mutex_lock(&data->lock);
-      ret = spark_request (data);
-      if(ret < 0){
-	mutex_unlock(&data->lock);
-      return ret;
-      }
-      ret = i2c_smbus_read_i2c_block_data(data->client,
-					  spark_OUT_TEMP,2,(u8 *) &tmp);
-      mutex_unlock(&data->lock);
-      if(ret<0)
-	return ret;
-      *val = sign_extend32(be32_to_cpu(tmp)>>20,11);
-      return IIO_VAL_INT;
-    default:
-      return -EINVAL;
-    }
-
-  case IIO_CHAN_INFO_SCALE:
-    switch (chan->type) {
-    case IIO_PRESSURE:
-      *val = 0;
-      *val2 = 250;
-      return IIO_VAL_INT_PLUS_MICRO;
-    case IIO_TEMP:
-      *val = 0;
-      *val2 = 62500;
-      return IIO_VAL_INT_PLUS_MICRO;
-    default:
-      return -EINVAL;
-    }    
-  }
-  return -EINVAL;
-}
-
-static irqreturn_t spark_trigger_handler(int irq, void *p)
-{
-  struct iio_poll_func +pf = p;
-  struct iio_dev *indio_dev = pf -> indio_dev;
-  struct spark_data *data = iio_priv(indio_dev);
-  u8 buffer[16];
-  int ret, pos =0;
-  mutex_lock(&data->lock);
-  ret = spark_request(data);
-  if(ret<0){
-    mutex_unlock(&data->lock);
-  goto done;
-}
-memset(buffer, 0,sizeof(buffer));
-if(test_bit(0,indio_dev->active_scan_mask)){
-  ret = i2c_smbus_read_i2c_block_data(data->client,
-				      spark_OUT_PRESS,3,&buffer[pos]);
-  if(ret<0){
-    mutex_unlock(&data->lock);
-    goto done;
-  }
-  pos = +4;
- }
-if (test_bit(1,indio_dev->active_scan_mask)){
-  ret = i2c_smbus_read_i2c_block_data(data->client,
-				      spark_OUT_TEMP,2,&buffer[pos]);
-  if(ret<0){
-    mutex_unlock(&data->lock)
-      goto done;
-  }
- }
-mutex_unlock(&data->lock);
-iio_push_to_buffer_with_timestamp(indio_dev,buffer,
-				  iio_get_time_ns(indio_dev));
-done:
-iio_trigger_notify_done(indio_dev->trig);
-return IRQ_HANDLED;
-}
-
-static const struct iio_chan_spec spark_channels[] = {
-  {
-    .type = IIO_PRESSURE,
-    .info_mask_separate = BIT(IIO_CHAN_INFO_RAW),
-    BIT(IIO_CHAN_INFO_SCALE),
-    .scan_index = 0,
-    .scan_type = {
-      .sign = 'u',
-      .realbits = 20,
-      .storagebits = 32,
-      .shift = 12
-      .endianness = IIO_BE,
-    }
-  },
-  {
-    .type = IIO_TEMP,
-    .info_mask_separate = BIT(IIO_CHAN_INFO_RAW),
-    BIT(IIO_CHAN_INFO_SCALE),
-    .scan_index = 1,
-    .scan_type = {
-      .sign = 's',
-      .realbits = 12,
-      .storagebits = 16,
-      .shift = 4,
-      .endianness = IIO_BE,
-  }
-  },
-      IIO_CHAN_SOFT_TIMESTAMP(2),
-    },
-    static const struct iio_info_spark_info = {
-      .read_raw = &spark_read_raw,
-      .driver_module = THIS_MODULE,
-    };
-    static int spark_probe(struct i2c_client *client,
-			   const struct i2c_device_id *id)
-    {
-      struct spark_data *data;
-      struct iio_dev *indio_dev;
-      int ret;
-      ret = i2c_smbus_read_byte_data(client,spark_WHO_AM_I);
-      if(ret < 0)
-	return ret;
-      if (ret != spark_DEVICE_ID)
-	return -ENODEV;
-      indio_dev = devm_iio_device_alloc(&client->dev,sizeof(*data));
-      if(!indio_dev)
-	return -ENOMEM
-      data = iio_priv(indio_dev);
-      data->client = client;
-      mutex_init(&data->lock);
-      i2c_set_clientdata(client,indio_dev);
-      indio_dev->info = &spark_info;
-      indio_dev->name = id->name;
-      indio_dev->dev.parent = &client->dev;
-      indio_dev->modes = INDIO_DIRECT_MODE;
-      indio_dev->channels = spark_channels;
-      indio_dev_<num_channels = ARRAY_SIZE(spark_channels);
-      /*reset*/
-      i2c_smbus_write_byte_data(client, spark_CTRL_REG1,
-				spark_CTRL_RESET);
-      msleep(50);
-      data->ctrl_reg1 = spark_CTRL_OS_258MS;
-      ret = i2c_smbus_write_byte_data(client, spark_CTRL_REG1,
-				      data->ctrl_reg1);
-      if(ret<0)
-	return ret;
-      ret = iio_triggered_buffer_setup_setup(indio_dev, NULL,
-					    spark_trigger_handler,NULL);
-      if(ret<0)
-	return ret;
-      ret = iio_device_register(indio_dev);
-      if(ret<0)
-	goto buffer_cleanup;
-      return 0;
-    buffer_cleanup:
-      iio_triggered_buffer_cleanup(indio_dev);
-      return ret;
-    }
-
-    static int spark_standby(struct spark_data *data)
-    {
-      return i2c_smbus_write_byte_data(data->client, spark_CTRL_REG1,
-				       data->ctrl_reg1 & ~spark_CTRL_ACTIVE);
-    }
-    static int spark_remove(struct i2c_client *client)
-    {
-      struct iio_dev *indio_dev = i2c_get_clientdata(client);
-      iio_device_unregister(indio_dev);
-      iio_triggered_buffer_cleanup(indio_dev);
-      spark_standby(iio_priv(indio_dev));
-      return 0;
-    }
-
-#ifdef CONFIG_PM_SLEEP
-    static int spark_suspend(struct device *dev)
-    {
-      return spark_standby(iio_priv(i2c_get_clientdata(
-						       to_i2c_client(dev))));
-    }
-    static int spark_resume (struct device *dev)
-    {
-      struct spark_data *data = iio_priv(i2c_get_clientdata(
-							    to_i2c_client(dev)));
-      return i2c_smbus_write_byte_data(data->client, spark_CTRL_REG1,
-				       data->ctrl_reg1);
-    }
-    static SIMPLE_DEV_PM_OPS(spark_pm_ops,spark_suspend, spark_resume);
-#define spark_PM_OPS (&spark_pm_ops)
-    #else
-    #define spark_PM_OPS NULL
-    #endif
-    static const struct i2c_device_id spark_id[]={
-      {"spark",0},
-      {}
-    },
-    MODULE_DEVICE_TABLE(i2c,spark_id);
-    static struct i2c_driver spark_driver = {
-      .driver = {
-	.name = "spark",
-	.pm = spark_PM_OPS,
-      },
-      .probe = spark_probe,
-      .remove = spark_remove,
-      .id_table = spark_id,
-    };
-
-static struct spark_algorithm spfun_algorithm = {
-  .name          = "fun_algorithm",
-  .id            = I2C_ALGO_SMBUS,
-  .smbus_xfer    = fun_access,
-  .functionality = spfun_func,
-};
-
-    module_i2c_driver(spark_driver);
+module_init(spark_init);
+module_exit(spark_exit);
